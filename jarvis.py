@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-VERSION = "2.3"
+VERSION = "2.6"
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(BASE, "jarvis_workspace")
 OUT = os.path.join(WORK, "hasil")
@@ -38,7 +38,7 @@ LOCK = threading.RLock()
 TOKEN = os.environ.get("JARVIS_TOKEN") or secrets.token_urlsafe(24)
 PORT = 0
 ST = {"updated": None, "rev": 0, "busy": False, "events": [], "cancel": False, "procs": [],
-      "last_ping": 0.0, "bye_at": 0.0}
+      "last_ping": 0.0, "bye_at": 0.0, "partial": "", "pt": 0.0}
 
 DEFAULTS = {
     "assistant": "Jarvis",
@@ -56,6 +56,8 @@ DEFAULTS = {
     "voice_rate": "1.05",
     "voice_name": "",
     "voice_auto": True,
+    "cepat": True,
+    "gh_repo": "Monstera-99/AI-Agent",
     "display": "cursor",
     "ontop": True,
 }
@@ -156,10 +158,10 @@ def perm():
     return p if p in ("ketat", "normal", "bebas") else "ketat"
 
 
-def build_args(agent, imgs):
+def build_args(agent, imgs, fast=False):
     fl = PERM_FLAGS[agent][perm()]
     if agent == "codex":
-        a = ["exec"] + fl
+        a = ["exec"] + fl + (["-c", "model_reasoning_effort=low"] if fast else [])
         if imgs:
             a += ["-i"] + [os.path.join(ATT, n) for n in imgs]
         return a + ["--skip-git-repo-check", "-"]
@@ -187,15 +189,22 @@ def save_images(items):
     return names
 
 
-def run(agent, prompt, imgs=None):
+def chat_env(fast):
+    e = dict(os.environ)
+    if fast:
+        e["MAX_THINKING_TOKENS"] = "0"
+    return e
+
+
+def run(agent, prompt, imgs=None, fast=False):
     exe = which2(agent)
     if not exe:
         raise RuntimeError("%s belum terpasang (Pengaturan > Akun)" % agent)
     if ST["cancel"]:
         raise RuntimeError("Dibatalkan")
-    p = subprocess.Popen([exe] + build_args(agent, imgs or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    p = subprocess.Popen([exe] + build_args(agent, imgs or [], fast), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, cwd=WORK, text=True, encoding="utf-8",
-                         errors="replace", creationflags=NOWIN)
+                         errors="replace", creationflags=NOWIN, env=chat_env(fast))
     with LOCK:
         ST["procs"].append(p)
     try:
@@ -218,11 +227,85 @@ def run(agent, prompt, imgs=None):
     return out
 
 
+def set_partial(txt, force=False):
+    now = time.time()
+    if force or now - ST["pt"] > 0.12:
+        with LOCK:
+            ST["partial"] = txt
+            ST["pt"] = now
+            ST["rev"] += 1
+
+
+def run_claude_stream(prompt, fast):
+    """Claude dengan keluaran bertahap. Mengembalikan None bila format tak dikenali (pemanggil jatuh ke run biasa)."""
+    exe = which2("claude")
+    if not exe:
+        raise RuntimeError("claude belum terpasang (Pengaturan > Akun)")
+    if ST["cancel"]:
+        raise RuntimeError("Dibatalkan")
+    args = [exe] + CMD["claude"][1:] + ["--output-format", "stream-json", "--verbose",
+                                        "--include-partial-messages"] + PERM_FLAGS["claude"][perm()]
+    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=WORK, text=True, encoding="utf-8", errors="replace",
+                         creationflags=NOWIN, env=chat_env(fast))
+    with LOCK:
+        ST["procs"].append(p)
+    errbuf = []
+    threading.Thread(target=lambda: errbuf.append(p.stderr.read()), daemon=True).start()
+    timer = threading.Timer(TIMEOUT, kill, [p])
+    timer.daemon = True
+    timer.start()
+    acc, final = "", None
+    try:
+        try:
+            p.stdin.write(prompt)
+            p.stdin.close()
+        except Exception:
+            pass
+        for line in p.stdout:
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            t = j.get("type")
+            if t == "stream_event":
+                e = j.get("event") or {}
+                d = e.get("delta") or {}
+                if e.get("type") == "content_block_delta" and d.get("type") == "text_delta":
+                    acc += d.get("text", "")
+                    set_partial(acc)
+            elif t == "result" and isinstance(j.get("result"), str):
+                final = j["result"]
+        p.wait()
+    finally:
+        timer.cancel()
+        with LOCK:
+            if p in ST["procs"]:
+                ST["procs"].remove(p)
+    if ST["cancel"]:
+        raise RuntimeError("Dibatalkan")
+    out = (final if final is not None else acc).strip()
+    if not out:
+        return None
+    return out
+
+
 OJ_URL = os.environ.get("JARVIS_OJ_URL", "http://127.0.0.1:8000")
+
+
+OJ_C = [0.0, False]
 
 
 def oj_alive():
     """OpenJarvis (jarvis serve) hanya dianggap ada bila server lokalnya menjawab /health."""
+    if time.time() - OJ_C[0] < 5:
+        return OJ_C[1]
+    OJ_C[1] = _oj_alive()
+    OJ_C[0] = time.time()
+    return OJ_C[1]
+
+
+def _oj_alive():
     try:
         import urllib.request
         with urllib.request.urlopen(OJ_URL + "/health", timeout=1.5) as r:
@@ -265,6 +348,7 @@ def pick(preferred):
 
 
 # ---------------------------------------------------------------- auto-update
+UPD_LOCK = threading.Lock()
 UPD = {"state": "idle", "new": "", "msg": "", "checked": 0.0}
 UPD_HOSTS = ("raw.githubusercontent.com", "github.com", "github.io", "githubusercontent.com")
 
@@ -331,6 +415,7 @@ def fetch(u, limit=2_000_000):
             raise RuntimeError("berkas terlalu besar")
         return data
     import urllib.request
+    u = u + ("&" if "?" in u else "?") + "_=%d" % int(time.time())  # lewati cache CDN GitHub
     rq = urllib.request.Request(u, headers={"User-Agent": "Jarvis-Updater", "Cache-Control": "no-cache"})
     with urllib.request.urlopen(rq, timeout=20) as r:
         data = r.read(limit + 1)
@@ -341,12 +426,32 @@ def fetch(u, limit=2_000_000):
 
 def check_update(apply=True):
     """Cek version.json; bila lebih baru: unduh, verifikasi sha256 + sintaks, ganti jarvis.py (cadangan .bak)."""
-    import hashlib, urllib.parse
-    u = update_url()
-    if not u:
-        UPD.update(state="off", msg="Alamat update belum diisi", checked=time.time())
+    if not UPD_LOCK.acquire(False):
         return
-    UPD.update(state="checking", msg="")
+    try:
+        _check_update(apply)
+    finally:
+        UPD_LOCK.release()
+
+
+def update_sources():
+    """Alamat update: pengaturan (GitHub) lebih dulu, lalu update_url.txt bawaan installer sebagai cadangan."""
+    out = []
+    u = (SETTINGS.get("update_url") or "").strip()
+    try:
+        d = open(os.path.join(BASE, "update_url.txt"), encoding="utf-8").read().strip()
+    except Exception:
+        d = ""
+    for x in (u, d):
+        x = os.path.expandvars(x) if x and is_local(x) else x
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _check_one(u, apply):
+    """Satu sumber. Mengembalikan (status, pesan, versi): ready | available | uptodate | err."""
+    import hashlib, urllib.parse
     try:
         loc = is_local(u)
         if not loc and not host_ok(u):
@@ -360,13 +465,10 @@ def check_update(apply=True):
             src = urllib.parse.urljoin(u, name)
             if not host_ok(src):
                 raise RuntimeError("alamat berkas update tidak diizinkan")
-        UPD["checked"] = time.time()
         if vt(ver) <= vt(VERSION):
-            UPD.update(state="uptodate", new="", msg="Sudah versi terbaru (%s)" % VERSION)
-            return
+            return "uptodate", "Sudah versi terbaru (%s)" % VERSION, ver
         if not apply:
-            UPD.update(state="available", new=ver, msg="Versi %s tersedia" % ver)
-            return
+            return "available", "Versi %s tersedia" % ver, ver
         data = fetch(src)
         if hashlib.sha256(data).hexdigest() != sha:
             raise RuntimeError("checksum tidak cocok, update dibatalkan")
@@ -383,21 +485,43 @@ def check_update(apply=True):
         except Exception:
             pass
         os.replace(new, me)
-        UPD.update(state="ready", new=ver, msg="Versi %s terpasang. Mulai ulang untuk memakainya." % ver)
+        return "ready", "Versi %s terpasang. Mulai ulang untuk memakainya." % ver, ver
     except Exception as e:
-        UPD.update(state="err", msg="Update gagal: %s" % str(e)[:120], checked=time.time())
-    finally:
-        ulog("%s: %s" % (UPD["state"], UPD["msg"]))
-        with LOCK:
-            ST["rev"] += 1
+        return "err", "Update gagal: %s" % str(e)[:120], ""
+
+
+def _check_update(apply):
+    srcs = update_sources()
+    if not srcs:
+        UPD.update(state="off", msg="Alamat update belum diisi", checked=time.time())
+        return
+    UPD.update(state="checking", msg="")
+    best = None
+    rank = {"ready": 3, "available": 2, "uptodate": 1, "err": 0}
+    for u in srcs:
+        r = _check_one(u, apply)
+        ulog("%s -> %s: %s" % (u[:60], r[0], r[1]))
+        if best is None or rank[r[0]] > rank[best[0]]:
+            best = r
+        if r[0] == "ready":
+            break
+    st, msg, ver = best
+    UPD.update(state=st, msg=msg, new=ver if st in ("ready", "available") else "", checked=time.time())
+    with LOCK:
+        ST["rev"] += 1
 
 
 def update_loop():
     time.sleep(6)
+    nxt = 0.0
     while True:
-        if SETTINGS.get("auto_update") and UPD["state"] != "ready":
+        now = time.time()
+        auto = SETTINGS.get("auto_update")
+        if auto and UPD["state"] != "ready" and now >= nxt:
             check_update(True)
-        if UPD["state"] == "ready" and SETTINGS.get("auto_update"):
+            # gagal (mis. offline): coba lagi lebih cepat; normal: tiap 10 menit
+            nxt = time.time() + (90 if UPD["state"] == "err" else 600)
+        if auto and UPD["state"] == "ready":
             # tunggu Jarvis tidak sedang mengerjakan tugas, lalu mulai ulang otomatis
             while ST["busy"]:
                 time.sleep(5)
@@ -407,7 +531,154 @@ def update_loop():
             time.sleep(3)
             restart_app()
             return
-        time.sleep(600)
+        time.sleep(10)
+
+
+# ---------------------------------------------------------------- terbit otomatis ke GitHub
+GH_API = os.environ.get("JARVIS_GH_API", "https://api.github.com")
+GH = {"connected": False, "msg": "", "last": "", "busy": False}
+GH_TOKEN_FILE = os.path.join(APPDIR, "gh.dat")
+
+
+def _blob_in(b):
+    import ctypes
+    from ctypes import wintypes
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(b, len(b))
+    return BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf, BLOB
+
+
+def protect(raw):
+    """Token disimpan terenkripsi (Windows DPAPI: hanya akun Windows ini yang bisa membukanya)."""
+    if IS_WIN:
+        try:
+            import ctypes
+            bi, _buf, BLOB = _blob_in(raw)
+            bo = BLOB()
+            if ctypes.windll.crypt32.CryptProtectData(ctypes.byref(bi), None, None, None, None, 0, ctypes.byref(bo)):
+                out = ctypes.string_at(bo.pbData, bo.cbData)
+                ctypes.windll.kernel32.LocalFree(bo.pbData)
+                if unprotect(b"W" + out) == raw:
+                    return b"W" + out
+        except Exception:
+            pass
+    import base64
+    return b"B" + base64.b64encode(raw)
+
+
+def unprotect(blob):
+    if blob[:1] == b"W" and IS_WIN:
+        import ctypes
+        bi, _buf, BLOB = _blob_in(blob[1:])
+        bo = BLOB()
+        if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(bi), None, None, None, None, 0, ctypes.byref(bo)):
+            raise OSError("dekripsi gagal")
+        out = ctypes.string_at(bo.pbData, bo.cbData)
+        ctypes.windll.kernel32.LocalFree(bo.pbData)
+        return out
+    import base64
+    return base64.b64decode(blob[1:])
+
+
+def gh_token():
+    try:
+        return unprotect(open(GH_TOKEN_FILE, "rb").read()).decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def gh_call(method, path, body=None, token=None):
+    import urllib.request, urllib.error
+    rq = urllib.request.Request(GH_API + path, method=method,
+                                data=json.dumps(body).encode() if body is not None else None,
+                                headers={"Authorization": "Bearer " + (token or gh_token()),
+                                         "Accept": "application/vnd.github+json",
+                                         "User-Agent": "Jarvis-Publisher", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(rq, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and method == "GET":
+            return None
+        raise RuntimeError("GitHub menjawab %s" % e.code)
+
+
+def gh_put(repo, name, data, token):
+    import base64
+    old = gh_call("GET", "/repos/%s/contents/%s" % (repo, name), token=token)
+    body = {"message": "Jarvis %s" % VERSION_PUB[0], "content": base64.b64encode(data).decode(),
+            "branch": "main"}
+    if old and old.get("sha"):
+        body["sha"] = old["sha"]
+    gh_call("PUT", "/repos/%s/contents/%s" % (repo, name), body, token)
+
+
+VERSION_PUB = [""]
+
+
+def gh_connect(token):
+    """Cek token + akses ke repo, lalu simpan terenkripsi."""
+    repo = SETTINGS["gh_repo"]
+    info = gh_call("GET", "/repos/" + repo, token=token)
+    if not info:
+        raise RuntimeError("repo %s tidak ditemukan" % repo)
+    if not (info.get("permissions") or {}).get("push"):
+        raise RuntimeError("token ini tidak boleh menulis ke repo itu")
+    with open(GH_TOKEN_FILE, "wb") as f:
+        f.write(protect(token.encode("utf-8")))
+    GH.update(connected=True, msg="Terhubung ke %s" % repo)
+
+
+def publish_dir():
+    for u in update_sources():
+        if is_local(u):
+            return os.path.dirname(u)
+    return None
+
+
+def gh_publish_once():
+    """Bila folder update lokal berisi versi baru (hasil kerja kita), unggah otomatis ke GitHub."""
+    import hashlib
+    tok, pd = gh_token(), publish_dir()
+    GH["connected"] = bool(tok)
+    if not tok or not pd:
+        return
+    mf = os.path.join(pd, "version.json")
+    mraw = open(mf, "rb").read()
+    m = json.loads(mraw.decode("utf-8"))
+    jraw = open(os.path.join(pd, os.path.basename(str(m.get("url", "jarvis.py")))), "rb").read()
+    if hashlib.sha256(jraw).hexdigest() != str(m["sha256"]).lower():
+        return  # berkas belum selesai disalin
+    mark = hashlib.sha256(mraw + jraw).hexdigest()
+    mp = os.path.join(APPDIR, "published.txt")
+    try:
+        if open(mp).read().strip() == mark:
+            return
+    except Exception:
+        pass
+    repo = SETTINGS["gh_repo"]
+    VERSION_PUB[0] = str(m["version"])
+    GH.update(busy=True, msg="Mengunggah versi %s ke GitHub..." % m["version"])
+    gh_put(repo, "jarvis.py", jraw, tok)
+    gh_put(repo, "version.json", mraw, tok)  # terakhir, supaya perangkat lain tidak melihat versi setengah jadi
+    open(mp, "w").write(mark)
+    GH.update(busy=False, msg="Versi %s terbit di GitHub" % m["version"], last=str(m["version"]))
+    ulog("terbit ke GitHub: versi %s" % m["version"])
+
+
+def gh_loop():
+    time.sleep(8)
+    while True:
+        try:
+            if gh_token():
+                gh_publish_once()
+        except Exception as e:
+            GH.update(busy=False, msg="Gagal terbit: %s" % str(e)[:100])
+            ulog("terbit gagal: %s" % e)
+        with LOCK:
+            ST["rev"] += 1
+        time.sleep(20)
 
 
 def restart_app():
@@ -441,9 +712,9 @@ def system_text():
 
 def chat_prompt(text, imgs=None):
     lines = [system_text(), "", "Riwayat percakapan:"]
-    for m in HISTORY[-9:-1]:
+    for m in HISTORY[-7:-1]:
         who = "Pengguna" if m["role"] == "user" else "Asisten"
-        lines.append("%s: %s" % (who, m["text"][:3000]))
+        lines.append("%s: %s" % (who, m["text"][:1500]))
     if imgs:
         lines += ["", "Pengguna melampirkan gambar (lihat/baca berkas ini):"] + [os.path.join(ATT, n) for n in imgs]
     rule = {"ketat": "Jangan mengubah file apa pun di komputer.",
@@ -563,7 +834,18 @@ def job(text, mode, imgs=None):
         else:
             agent = pick(mode if mode in CMD else SETTINGS["agent"])
             ev("agent", agent, "berpikir")
-            reply = run(agent, chat_prompt(text, imgs), imgs)
+            fast = bool(SETTINGS.get("cepat"))
+            pr = chat_prompt(text, imgs)
+            reply = None
+            if agent == "claude":
+                try:
+                    reply = run_claude_stream(pr, fast)
+                except RuntimeError:
+                    raise
+                except Exception:
+                    reply = None
+            if not reply:
+                reply = run(agent, pr, imgs, fast)
             ev("agent", agent, "selesai", "ok")
             if SETTINGS["skill_save"]:
                 saved = save_code(reply)
@@ -583,7 +865,7 @@ def job(text, mode, imgs=None):
                 if t["state"] == "run":
                     t["state"] = "err"
             HISTORY.append({"role": "assistant", "text": reply or "(kosong)", "tools": tools})
-            ST.update(busy=False, events=[], cancel=False, procs=[])
+            ST.update(busy=False, events=[], cancel=False, procs=[], partial="")
             ST["rev"] += 1
         save()
 
@@ -959,7 +1241,7 @@ function render(){
    if(m.imgs&&m.imgs.length)h+=`<div class="imgs">`+m.imgs.map(n=>`<img src="/api/img?n=${encodeURIComponent(n)}&t=${T}" data-big="1" alt="">`).join("")+`</div>`;
    if(!(m.imgs&&m.imgs.length&&m.text==="(gambar terlampir)"))h+=`<div class="m u">${esc(m.text)}</div>`}
   else h+=chips(m.tools)+`<div class="m a">${md(m.text)}</div>`}
- if(S.busy)h+=chips(S.events)+`<div class="m a">...</div>`;
+ if(S.busy)h+=chips(S.events)+`<div class="m a">${S.partial?md(S.partial):"..."}</div>`;
  ch.innerHTML=h;if(near||S.busy)ch.scrollTop=ch.scrollHeight;
  const sb=$("#send");sb.className=S.busy?"stop":"";
  sb.innerHTML=S.busy?`<svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>`:
@@ -1081,7 +1363,8 @@ function drawSet(){
   <label>Nama asisten</label><input type="text" data-k="assistant" value="${esc(form.assistant)}">
   <label>Nama kamu</label><input type="text" data-k="user" value="${esc(form.user)}">
   <label>Kepribadian</label><textarea class="f" data-k="persona">${esc(form.persona)}</textarea>
-  <div class="hint">{assistant} dan {user} diganti otomatis.</div>`}
+  <div class="hint">{assistant} dan {user} diganti otomatis.</div>`+
+  sw("cepat","Mode cepat","Jawaban muncul bertahap dan Claude/Codex tidak berpikir terlalu lama. Matikan untuk tugas rumit yang butuh analisis dalam.")}
  if(tab==="tampil"){
   h+=`<label>Penempatan layar</label><select data-k="display" id="dSel"><option value="cursor">Ikuti kursor</option><option value="primary">Layar utama</option><option value="auto">Otomatis (layar yang jarang dipakai)</option></select>
   <div class="hint">Otomatis memindahkan Jarvis ke layar yang paling jarang kamu pakai, dengan jeda supaya tidak bolak-balik. Jarvis tidak pindah saat kamu sedang mengetik atau kursor di atasnya.</div>`+
@@ -1115,6 +1398,10 @@ function drawSet(){
   h+=`<div class="card"><div class="t"><b>Pembaruan otomatis</b><div class="d" id="updMsg"></div></div></div>
   <label>Alamat update (version.json di GitHub, atau jalur folder lokal/OneDrive)</label><input type="text" data-k="update_url" placeholder="https://raw.githubusercontent.com/AKUN/jarvis/main/version.json">
   <label><input type="checkbox" data-k="auto_update"> Pasang update dan mulai ulang otomatis</label>
+  <div class="card"><div class="t"><b>Terbit otomatis ke GitHub</b><div class="d" id="ghMsg"></div></div></div>
+  <div id="ghSetup"><div class="hint">Satu kali saja: <b>1)</b> klik tombol di bawah, GitHub terbuka. <b>2)</b> Tekan "Generate token" (hijau) di paling bawah halaman. <b>3)</b> Salin token yang muncul, tempel di kotak ini, tekan Hubungkan. Setelah itu setiap perubahan Jarvis terbit sendiri dan semua Jarvis lain ikut diperbarui.</div>
+  <button class="btn g" id="ghOpen">Buka GitHub untuk membuat token</button>
+  <input type="password" id="ghTok" placeholder="Tempel token di sini" autocomplete="off"> <button class="btn" id="ghSave">Hubungkan</button></div>
   <button class="btn g" id="updNow">Cek update sekarang</button> <button class="btn" id="updRestart" style="display:none">Mulai ulang</button>
   <div class="hint">Dicek tiap 10 menit. Versi baru diunduh, diverifikasi checksum SHA-256 dan sintaks, lalu Jarvis mulai ulang sendiri saat tidak sibuk. Cadangan: jarvis.py.bak. Catatan update ada di <code>update.log</code> di folder data.</div>`}
  if(tab==="tentang"){
@@ -1140,7 +1427,11 @@ function drawSet(){
   $("#vTest").onclick=()=>{const keep=S.settings;S.settings=Object.assign({},keep,{voice_name:form.voice_name,voice_rate:form.voice_rate});speak("Halo, aku Jarvis. Beginilah suaraku.");S.settings=keep}}
  if(tab==="update"){const U=S.update||{};$("#updMsg").textContent=U.msg||"Belum dicek";
   $("#updNow").onclick=()=>api("/api/settings",{update_url:form.update_url||"",auto_update:!!form.auto_update}).then(()=>api("/api/update/check",{apply:true}));
-  const rb=$("#updRestart");rb.style.display=U.state==="ready"?"inline-block":"none";rb.onclick=doRestart}
+  const rb=$("#updRestart");rb.style.display=U.state==="ready"?"inline-block":"none";rb.onclick=doRestart;
+  const G=S.gh||{};$("#ghMsg").textContent=G.connected?(G.msg||"Terhubung. Perubahan terbit otomatis."):"Belum terhubung";
+  $("#ghSetup").style.display=G.connected?"none":"block";
+  $("#ghOpen").onclick=()=>window.open("https://github.com/settings/tokens/new?scopes=public_repo&description=Jarvis%20update","_blank");
+  $("#ghSave").onclick=async()=>{const r=await api("/api/gh/token",{token:$("#ghTok").value});$("#ghTok").value="";toast(r.ok?"GitHub terhubung":(r.error||"Token ditolak"));rev=-1;poll()}}
 }
 const AKUN_HTML=`<div class="hint">Masuk dengan akun langgananmu sendiri. Jarvis tidak menyimpan password atau token: login dikerjakan CLI resmi (Claude Code &amp; Codex) di komputer ini.</div>
 <div id="accCards"></div>
@@ -1200,7 +1491,7 @@ let down=0;
 setInterval(()=>api("/api/ping",{}).then(()=>{down=0}).catch(()=>{if(++down===2)waitBack()}),3000);
 function waitBack(){const t=setInterval(()=>fetch("/api/state",{headers:{"X-Token":T}}).then(x=>{if(x.ok){clearInterval(t);location.reload()}}).catch(()=>{}),1500)}
 window.addEventListener("pagehide",()=>{try{navigator.sendBeacon("/api/bye?t="+T)}catch(e){}});
-poll();setInterval(poll,800);$("#in").focus();
+poll();setInterval(poll,350);$("#in").focus();
 </script></html>"""
 
 
@@ -1264,7 +1555,7 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/state" and self.ok_token():
             with LOCK:
                 d = {"rev": ST["rev"], "busy": ST["busy"], "events": ST["events"],
-                     "history": HISTORY, "settings": SETTINGS, "accounts": ACC, "openjarvis": oj_alive(), "update": UPD,
+                     "partial": ST["partial"], "history": HISTORY, "settings": SETTINGS, "accounts": ACC, "openjarvis": oj_alive(), "update": UPD, "gh": dict(GH, repo=SETTINGS["gh_repo"]),
                      "npm": bool(which2("npm")), "sess": sess_view(),
                      "work": OUT, "version": VERSION, "updated": ST["updated"], "appdir": APPDIR}
                 return self.send(json.dumps(d, ensure_ascii=False))
@@ -1326,6 +1617,11 @@ class H(BaseHTTPRequestHandler):
             open_folder(OUT)
         elif u.path == "/api/update/check":
             threading.Thread(target=check_update, args=(bool(d.get("apply", True)),), daemon=True).start()
+        elif u.path == "/api/gh/token":
+            try:
+                gh_connect(str(d.get("token", "")).strip())
+            except Exception as e:
+                r = {"ok": False, "error": str(e)[:120]}
         elif u.path == "/api/restart":
             if not ST["busy"]:
                 restart_app()
@@ -1415,9 +1711,30 @@ def watchdog():
             os._exit(0)
 
 
+def other_instance():
+    """Alamat Jarvis lain yang masih hidup (satu pengguna = satu Jarvis), atau None."""
+    try:
+        import urllib.request
+        d = json.load(open(os.path.join(APPDIR, "instance.json"), encoding="utf-8"))
+        rq = urllib.request.Request("http://127.0.0.1:%d/api/state" % d["port"], headers={"X-Token": d["token"]})
+        with urllib.request.urlopen(rq, timeout=2) as r:
+            if r.status == 200:
+                return "http://127.0.0.1:%d/?t=%s" % (d["port"], d["token"])
+    except Exception:
+        pass
+    return None
+
+
 def main():
     global PORT
     load()
+    if not (os.environ.get("JARVIS_RETRY") or os.environ.get("JARVIS_SHELL") or os.environ.get("JARVIS_MULTI")):
+        ex = other_instance()
+        if ex:
+            if not os.environ.get("JARVIS_NO_BROWSER"):
+                launch_window(ex)
+                time.sleep(2)
+            return
     srv = None
     base = int(os.environ.get("JARVIS_PORT", 8765))
     if os.environ.get("JARVIS_RETRY"):
@@ -1440,9 +1757,15 @@ def main():
         sys.exit("Tidak ada port kosong")
     url = "http://127.0.0.1:%d/?t=%s" % (PORT, TOKEN)
     pr("Jarvis berjalan:", url)
+    try:
+        with open(os.path.join(APPDIR, "instance.json"), "w", encoding="utf-8") as f:
+            json.dump({"port": PORT, "token": TOKEN, "pid": os.getpid()}, f)
+    except Exception:
+        pass
     threading.Thread(target=check_accounts, daemon=True).start()
     announce_update()
     threading.Thread(target=update_loop, daemon=True).start()
+    threading.Thread(target=gh_loop, daemon=True).start()
     if not os.environ.get("JARVIS_NO_BROWSER"):
         threading.Thread(target=launch_window, args=(url,), daemon=True).start()
     if not os.environ.get("JARVIS_NO_WATCHDOG"):
